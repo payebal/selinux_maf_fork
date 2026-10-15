@@ -951,6 +951,13 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     } else {
         data = (void *)a->arg0;
         len = (size_t)a->arg1;
+		if (len > MAGISK_POLICY_MAX_SIZE || !len || !data)
+		{
+			/* Some devices use stateful layouts but do not export the `selinux_state` symbol; 
+			 * this execution branch is intended to address this situation. */
+			data = (void *)a->arg1;
+			len = (size_t)a->arg2;
+		}
     }
 
     if (!data || !len || len > MAGISK_POLICY_MAX_SIZE || !vmalloc_fn) {
