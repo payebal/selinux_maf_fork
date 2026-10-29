@@ -74,19 +74,30 @@ static bool read_user_path(char *dst, size_t dstlen, uint64_t upath)
  * syscall_argn() resolves that for us regardless of kernel config.
  */
 
+static u32 g_stat_hits;
+static u32 g_stat_path_fail;
+static u32 g_fstatat_calls;
+
 static void before_newfstatat(hook_fargs4_t *a, void *u)
 {
     char path[96];
     uint64_t arg1;
 
+    if (++g_fstatat_calls == 1)
+        pr_info("[duckadbd] fstatat callback first call uid=%d\n", current_uid());
     if (!app_uid() || !a)
         return;
     arg1 = syscall_argn(a, 1); /* filename */
-    if (!read_user_path(path, sizeof(path), arg1))
+    if (!read_user_path(path, sizeof(path), arg1)) {
+        if (++g_stat_path_fail == 1)
+            pr_info("[duckadbd] fstatat: path read failed arg1=%llx\n", arg1);
         return;
+    }
     if (!path_is_adbd_socket(path))
         return;
 
+    if (++g_stat_hits == 1)
+        pr_info("[duckadbd] fstatat: masking /dev/socket/adbd for uid %d\n", current_uid());
     a->ret = (uint64_t)(-(uint64_t)ENOENT);
     a->skip_origin = 1;
 }
@@ -95,7 +106,10 @@ static void before_statx(hook_fargs4_t *a, void *u)
 {
     char path[96];
     uint64_t arg1;
+    static u32 statx_calls;
 
+    if (++statx_calls == 1)
+        pr_info("[duckadbd] statx callback first call uid=%d\n", current_uid());
     if (!app_uid() || !a)
         return;
     arg1 = syscall_argn(a, 1); /* filename */

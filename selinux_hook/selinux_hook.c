@@ -1496,12 +1496,13 @@ static bool value_has_root_token(const char *value, size_t size)
  * probes (context oracle ~24 writes, SID-table ~12) never reach it.
  */
 #define EAGAIN_INJECT_THRESHOLD 200
+#define EINVAL_PROBE_SLOTS 64
 
 struct einval_probe_slot {
     void *task;
     u32 count;
 };
-static struct einval_probe_slot g_einval_probe_slots[8];
+static struct einval_probe_slot g_einval_probe_slots[EINVAL_PROBE_SLOTS];
 
 static u32 einval_probe_count_get(void *task)
 {
@@ -1510,7 +1511,7 @@ static u32 einval_probe_count_get(void *task)
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < EINVAL_PROBE_SLOTS; i++) {
         if (g_einval_probe_slots[i].task == task) {
             count = g_einval_probe_slots[i].count;
             break;
@@ -1527,7 +1528,7 @@ static void einval_probe_count_inc(void *task)
 
     if (g_raw_spin_lock_fn)
         g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < EINVAL_PROBE_SLOTS; i++) {
         if (g_einval_probe_slots[i].task == task) {
             g_einval_probe_slots[i].count++;
             break;
@@ -1535,7 +1536,7 @@ static void einval_probe_count_inc(void *task)
         if (empty < 0 && !g_einval_probe_slots[i].task)
             empty = i;
     }
-    if (i == 8 && empty >= 0) {
+    if (i == EINVAL_PROBE_SLOTS && empty >= 0) {
         g_einval_probe_slots[empty].task = task;
         g_einval_probe_slots[empty].count = 1;
     }
