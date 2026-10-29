@@ -1535,7 +1535,43 @@ static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(current_uid()))
         return;
 
-    if (!g_fake_status_page || !vmalloc_to_page_fn)
+    if (!vmalloc_to_page_fn)
+        return;
+
+    /*
+     * Lazy fake-page allocation: at pre-kernel-init (module init) the
+     * allocator may not be ready yet, so vmalloc() can fail and the
+     * redirect would be silently abandoned for the whole boot.  The
+     * hook itself is installed unconditionally; allocate (once, under
+     * the scope lock) on first real open, where syscall context
+     * guarantees a working vmalloc.  If the alloc still fails, fall
+     * through and let the caller see the stock page.
+     */
+    if (!g_fake_status_page && vmalloc_fn) {
+        void *fake;
+        size_t fake_page_size = runtime_page_size();
+
+        if (g_raw_spin_lock_fn)
+            g_raw_spin_lock_fn(&g_scopes_lock);
+        fake = g_fake_status_page;
+        if (!fake) {
+            fake = vmalloc_fn(fake_page_size);
+            if (fake) {
+                zero_bytes(fake, fake_page_size);
+                copy_bytes(fake, g_clean_status_bytes,
+                           sizeof(g_clean_status_bytes));
+                /* publish contents before publishing the pointer */
+                barrier();
+                WRITE_ONCE(g_fake_status_page, fake);
+                pr_info("[selinux_hook] lazy fake status page allocated size=%zu\n",
+                        fake_page_size);
+            }
+        }
+        if (g_raw_spin_unlock_fn)
+            g_raw_spin_unlock_fn(&g_scopes_lock);
+    }
+
+    if (!g_fake_status_page)
         return;
 
     page = vmalloc_to_page_fn(g_fake_status_page);
@@ -1550,8 +1586,6 @@ static bool install_status_page_redirect(void)
 {
     unsigned long addr;
     hook_err_t err;
-    void *page;
-    size_t fake_page_size = runtime_page_size();
 
     if (READ_ONCE(g_status_page_redirect_hooked))
         return true;
@@ -1559,24 +1593,6 @@ static bool install_status_page_redirect(void)
     if (!vmalloc_fn || !vmalloc_to_page_fn) {
         pr_warn("[selinux_hook] status page redirect unavailable vmalloc=%px vmalloc_to_page=%px\n",
                 vmalloc_fn, vmalloc_to_page_fn);
-        return false;
-    }
-
-    if (!g_fake_status_page) {
-        g_fake_status_page = vmalloc_fn(fake_page_size);
-        if (!g_fake_status_page) {
-            pr_warn("[selinux_hook] fake status page allocation failed size=%zu\n",
-                    fake_page_size);
-            return false;
-        }
-        zero_bytes(g_fake_status_page, fake_page_size);
-        copy_bytes(g_fake_status_page, g_clean_status_bytes,
-                   sizeof(g_clean_status_bytes));
-    }
-
-    page = vmalloc_to_page_fn(g_fake_status_page);
-    if (!page) {
-        pr_warn("[selinux_hook] cannot translate fake status page to struct page\n");
         return false;
     }
 
@@ -1588,7 +1604,12 @@ static bool install_status_page_redirect(void)
 
     /* Both void(void) and stateful page-factory ABIs are safe through the
      * four-register transit: a state argument remains in x0 when present,
-     * while a void function ignores it. */
+     * while a void function ignores it.
+     *
+     * The fake page itself is NOT allocated here: at pre-kernel-init the
+     * allocator may not be up yet, so a failing vmalloc would permanently
+     * disable the redirect.  The before-hook lazily allocates the page on
+     * first use from syscall context, where vmalloc is guaranteed. */
     err = hook_wrap((void *)addr, 1, before_selinux_kernel_status_page,
                     NULL, NULL);
     if (err != HOOK_NO_ERR) {
@@ -1599,8 +1620,8 @@ static bool install_status_page_redirect(void)
 
     record_inline_hook((void *)addr, before_selinux_kernel_status_page, NULL);
     WRITE_ONCE(g_status_page_redirect_hooked, true);
-    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px size=%zu\n",
-            (void *)addr, g_fake_status_page, page, fake_page_size);
+    pr_info("[selinux_hook] status page redirect installed (lazy fake page) factory=%px\n",
+            (void *)addr);
     return true;
 }
 
