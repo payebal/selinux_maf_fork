@@ -52,15 +52,23 @@ static bool path_is_adbd_socket(const char *p)
     return p[i] == '\0';
 }
 
-/* Copy a user pathname; returns true when a NUL-terminated copy landed in dst. */
+/* Copy a user pathname; returns true when a NUL-terminated copy landed in dst.
+ * Apps pass scudo/MTE-tagged pointers (0xb4xxxxxxxxxxxxxx top byte); strip
+ * the tag before uaccess — 4.14 usercopy rejects tagged addresses. */
 static bool read_user_path(char *dst, size_t dstlen, uint64_t upath)
 {
     long n;
+    uint64_t clean = upath & 0x00FFFFFFFFFFFFFFULL;
 
-    if ((long)upath <= 0)
+    if ((long)clean <= 0)
         return false;
-    n = compat_strncpy_from_user(dst, (const char __user *)(uintptr_t)upath,
+    n = compat_strncpy_from_user(dst, (const char __user *)(uintptr_t)clean,
                                  (long)dstlen);
+    if (n <= 0 && (upath >> 56) != 0) {
+        /* tagged-ABI kernel fallback */
+        n = compat_strncpy_from_user(dst, (const char __user *)(uintptr_t)upath,
+                                     (long)dstlen);
+    }
     if (n <= 0)
         return false;
     if (n >= (long)dstlen)
@@ -200,7 +208,7 @@ static long duckadbd_exit(void *reserved)
 }
 
 KPM_NAME("duckadbd");
-KPM_VERSION("1.2.0");
+KPM_VERSION("1.2.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("payebal");
 KPM_DESCRIPTION("Hide adbd init socket and jdwp-control from apps uid>=10000");
