@@ -8,33 +8,34 @@
  *     the detector reads EACCES/EPERM as "listener exists")
  *
  * Property spoofing (init.svc.adbd=stopped, persist.sys.usb.config=mtp) is
- * done in userspace (resetprop -n + watchdog); this module only removes the
+ * done in userspace (resetprop -n); this module only removes the
  * kernel-visible sockets that would otherwise contradict the stopped story.
  */
 
-#include <linux/kernel.h>
+#include <compiler.h>
+#include <kpmodule.h>
+#include <ksyms.h>
+#include <hook.h>
+#include <syscall.h>
+#include <kputils.h>
 #include <linux/printk.h>
+#include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <asm/current.h>
 #include <uapi/asm-generic/errno.h>
-#include <ksyms.h>
-#include <hook.h>
-#include <kpmodule.h>
-#include <kputils.h>
+#include <uapi/asm-generic/unistd.h>
 
 #define offsetof_local(TYPE, MEMBER) ((size_t) & ((TYPE *)0)->MEMBER)
 
-/* copy_to_user through the KP_EXPORT_SYMBOL'd platform helper */
-static bool copy_to_user_helper(void *dst, const void *src, size_t n)
-{
-    int rc = compat_copy_to_user(dst, src, (int)n);
-    return rc != 0;
-}
-
 typedef unsigned long (*copy_from_user_fn_t)(void *to, const void *from, unsigned long n);
 static copy_from_user_fn_t copy_from_user_fn;
+
+static bool app_uid(void)
+{
+    return current_uid() >= 10000;
+}
 
 /* returns true when the whole chunk was copied */
 static bool copy_from_user_helper(void *dst, const void *src, size_t n)
@@ -42,11 +43,6 @@ static bool copy_from_user_helper(void *dst, const void *src, size_t n)
     if (!copy_from_user_fn)
         return false;
     return copy_from_user_fn(dst, src, (unsigned long)n) == 0;
-}
-
-static bool app_uid(void)
-{
-    return current_uid() >= 10000;
 }
 
 static bool path_is_adbd_socket(const char *p)
@@ -75,22 +71,25 @@ static bool read_user_path(char *dst, size_t dstlen, uint64_t upath)
     if (n <= 0)
         return false;
     if (n >= (long)dstlen)
-        n = (long)dstlen - 1; /* truncated source: still comparable, worst case a miss */
+        n = (long)dstlen - 1; /* truncated: still comparable, worst case a miss */
     dst[n] = '\0';
     return true;
 }
 
 /*
- * sys_newfstatat(int dfd, const char __user *filename,
- *                struct stat __user *statbuf, int flag)
+ * Hook bodies. With has_syscall_wrapper the syscall args live in pt_regs;
+ * syscall_argn() resolves that for us regardless of kernel config.
  */
-static void before_sys_newfstatat(hook_fargs4_t *a, void *u)
+
+static void before_newfstatat(hook_fargs4_t *a, void *u)
 {
     char path[96];
+    uint64_t arg1;
 
     if (!app_uid() || !a)
         return;
-    if (!read_user_path(path, sizeof(path), a->arg1))
+    arg1 = syscall_argn(a, 1); /* filename */
+    if (!read_user_path(path, sizeof(path), arg1))
         return;
     if (!path_is_adbd_socket(path))
         return;
@@ -99,17 +98,15 @@ static void before_sys_newfstatat(hook_fargs4_t *a, void *u)
     a->skip_origin = 1;
 }
 
-/*
- * sys_statx(int dfd, const char __user *filename, unsigned int flags,
- *           unsigned int mask, struct statx __user *buffer)
- */
-static void before_sys_statx(hook_fargs8_t *a, void *u)
+static void before_statx(hook_fargs4_t *a, void *u)
 {
     char path[96];
+    uint64_t arg1;
 
     if (!app_uid() || !a)
         return;
-    if (!read_user_path(path, sizeof(path), a->arg1))
+    arg1 = syscall_argn(a, 1); /* filename */
+    if (!read_user_path(path, sizeof(path), arg1))
         return;
     if (!path_is_adbd_socket(path))
         return;
@@ -132,11 +129,7 @@ static bool name_is_adbd(const char *name)
            name[3] == 'd' && name[4] == '\0';
 }
 
-/*
- * sys_getdents64(unsigned int fd, struct linux_dirent64 __user *dirent,
- *                unsigned int count) — drop "adbd" entries for app uids.
- */
-static void after_sys_getdents64(hook_fargs4_t *a, void *u)
+static void after_getdents64(hook_fargs4_t *a, void *u)
 {
     char kbuf[2048];
     struct dents64_min *de;
@@ -149,7 +142,7 @@ static void after_sys_getdents64(hook_fargs4_t *a, void *u)
     ret = (long)a->ret;
     if (ret <= 0)
         return;
-    user_buf = (unsigned long)a->arg1;
+    user_buf = (unsigned long)syscall_argn(a, 1); /* dirent */
     if (!user_buf)
         return;
 
@@ -180,7 +173,7 @@ static void after_sys_getdents64(hook_fargs4_t *a, void *u)
         if (out != chunk) {
             for (i = out; i < chunk; i++)
                 kbuf[i] = 0;
-            if (!copy_to_user_helper((void *)(user_buf + total), kbuf, chunk))
+            if (!compat_copy_to_user((void *)(user_buf + total), kbuf, (int)chunk))
                 return;
         }
         kept += (long)out;
@@ -219,57 +212,63 @@ static bool uaddr_is_jdwp(uint64_t arg1, uint64_t arg2)
     return kaddr.sun_path[1 + sizeof(name) - 1] == '\0';
 }
 
-static void before_unix_stream_connect(hook_fargs4_t *a, void *u)
+static void before_connect(hook_fargs4_t *a, void *u)
 {
     if (!app_uid() || !a)
         return;
-    if (!uaddr_is_jdwp(a->arg1, a->arg2))
+    if (!uaddr_is_jdwp(syscall_argn(a, 1), syscall_argn(a, 2)))
         return;
 
     a->ret = (uint64_t)(-(uint64_t)ECONNREFUSED);
     a->skip_origin = 1;
 }
 
-/*
- * copy_to_user wrapper lives at the top of the file now (before first use).
- */
 static long duckadbd_init(const char *args, const char *event, void *reserved)
 {
-    unsigned long addr;
+    hook_err_t err;
     int installed = 0;
 
     copy_from_user_fn = (copy_from_user_fn_t)kallsyms_lookup_name("_copy_from_user");
     if (!copy_from_user_fn)
         copy_from_user_fn = (copy_from_user_fn_t)kallsyms_lookup_name("copy_from_user");
+    if (!copy_from_user_fn) {
+        pr_err("[duckadbd] no copy_from_user ksym\n");
+        return -1;
+    }
 
-    addr = kallsyms_lookup_name("sys_newfstatat");
-    if (addr && hook_wrap((void *)addr, 4, before_sys_newfstatat, NULL, NULL) == HOOK_NO_ERR)
-        installed++;
+    /* syscall hooks by number: survives unregistered-symbols and wrappers */
+    err = inline_hook_syscalln(__NR_newfstatat, 4, before_newfstatat, NULL, NULL);
+    if (err == HOOK_NO_ERR) installed++;
+    else pr_err("[duckadbd] newfstatat hook err %d\n", err);
 
-    addr = kallsyms_lookup_name("sys_statx");
-    if (addr && hook_wrap((void *)addr, 5, before_sys_statx, NULL, NULL) == HOOK_NO_ERR)
-        installed++;
+    err = inline_hook_syscalln(__NR_statx, 5, before_statx, NULL, NULL);
+    if (err == HOOK_NO_ERR) installed++;
+    else pr_err("[duckadbd] statx hook err %d\n", err);
 
-    addr = kallsyms_lookup_name("sys_getdents64");
-    if (addr && hook_wrap((void *)addr, 3, NULL, after_sys_getdents64, NULL) == HOOK_NO_ERR)
-        installed++;
+    err = inline_hook_syscalln(__NR_getdents64, 3, NULL, after_getdents64, NULL);
+    if (err == HOOK_NO_ERR) installed++;
+    else pr_err("[duckadbd] getdents64 hook err %d\n", err);
 
-    addr = kallsyms_lookup_name("unix_stream_connect");
-    if (addr && hook_wrap((void *)addr, 4, before_unix_stream_connect, NULL, NULL) == HOOK_NO_ERR)
-        installed++;
+    err = inline_hook_syscalln(__NR_connect, 3, before_connect, NULL, NULL);
+    if (err == HOOK_NO_ERR) installed++;
+    else pr_err("[duckadbd] connect hook err %d\n", err);
 
-    pr_info("[duckadbd] installed %d hooks\n", installed);
+    pr_info("[duckadbd] installed %d hooks (wrapper=%d)\n", installed, has_syscall_wrapper);
     return installed > 0 ? 0 : -1;
 }
 
 static long duckadbd_exit(void *reserved)
 {
+    inline_unhook_syscalln(__NR_newfstatat, before_newfstatat, NULL);
+    inline_unhook_syscalln(__NR_statx, before_statx, NULL);
+    inline_unhook_syscalln(__NR_getdents64, NULL, after_getdents64);
+    inline_unhook_syscalln(__NR_connect, before_connect, NULL);
     pr_info("[duckadbd] exit\n");
     return 0;
 }
 
 KPM_NAME("duckadbd");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("payebal");
 KPM_DESCRIPTION("Hide adbd init socket and jdwp-control from apps uid>=10000");
