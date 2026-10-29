@@ -1480,6 +1480,69 @@ static bool value_has_root_token(const char *value, size_t size)
     return false;
 }
 
+/*
+ * Detector timing-probe breaker.
+ *
+ * The App Zygote A/B timing probe issues 512 pairs (1024+) EINVAL-bound
+ * attr/current writes. On a completed sample the platform noise floor
+ * (~50-200ns) reads as "positive asymmetry" and raises a Danger verdict
+ * even on stock kernels (eltavine/Duck-Detector-Refactoring#409). The
+ * probe's own rules map an incomplete sample to inconclusive unless it
+ * keeps >=256 accepted pairs AND >=90% A-slower pairs. Aborting around
+ * pair ~100 stays far below that exception on both axes.
+ *
+ * Count EINVAL-destined attr/current writes per task (uid >= 10000, no
+ * root token); on the 200th, answer the write with -EAGAIN once. Legit
+ * probes (context oracle ~24 writes, SID-table ~12) never reach it.
+ */
+#define EAGAIN_INJECT_THRESHOLD 200
+
+struct einval_probe_slot {
+    void *task;
+    u32 count;
+};
+static struct einval_probe_slot g_einval_probe_slots[8];
+
+static u32 einval_probe_count_get(void *task)
+{
+    u32 count = 0;
+    int i;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < 8; i++) {
+        if (g_einval_probe_slots[i].task == task) {
+            count = g_einval_probe_slots[i].count;
+            break;
+        }
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+    return count;
+}
+
+static void einval_probe_count_inc(void *task)
+{
+    int i, empty = -1;
+
+    if (g_raw_spin_lock_fn)
+        g_raw_spin_lock_fn(&g_scopes_lock);
+    for (i = 0; i < 8; i++) {
+        if (g_einval_probe_slots[i].task == task) {
+            g_einval_probe_slots[i].count++;
+            break;
+        }
+        if (empty < 0 && !g_einval_probe_slots[i].task)
+            empty = i;
+    }
+    if (i == 8 && empty >= 0) {
+        g_einval_probe_slots[empty].task = task;
+        g_einval_probe_slots[empty].count = 1;
+    }
+    if (g_raw_spin_unlock_fn)
+        g_raw_spin_unlock_fn(&g_scopes_lock);
+}
+
 static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
     const char *name = (const char *)a->arg0;
@@ -1509,8 +1572,21 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
      * path, so per-payload cost stays stock; root candidates are still
      * evaluated against the clean snapshot and answered with EINVAL.
      */
-    if (!value_has_root_token(value, size))
+    if (!value_has_root_token(value, size)) {
+        /*
+         * Break the 512-pair timing probe: once a task has produced enough
+         * consecutive EINVAL-destined writes, answer this one with EAGAIN
+         * so the probe's own incompleteness rules map the sample to
+         * inconclusive instead of a noise-floor positive.
+         */
+        if (einval_probe_count_get(current) >= EAGAIN_INJECT_THRESHOLD) {
+            a->ret = (uint64_t)(long)-EAGAIN;
+            a->skip_origin = 1;
+            pr_info("[selinux_hook] injected EAGAIN into attr/current timing probe uid=%d comm=%s\n",
+                    current_uid(), current_comm());
+        }
         return;
+    }
 
     if (enter_clean_eval_scope())
         a->local.data0 = 1;
@@ -1518,8 +1594,22 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 
 static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
+    const char *name = (const char *)a->arg0;
+    const char *value = (const char *)a->arg1;
+    size_t size = (size_t)a->arg2;
+    uid_t uid = current_uid();
+
     if (a->local.data0)
         leave_clean_eval_scope();
+
+    if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
+        return;
+    if (a->skip_origin)
+        return;
+    if (value_has_root_token(value, size))
+        return;
+    if ((int64_t)a->ret == -EINVAL)
+        einval_probe_count_inc(current);
 }
 
 /*
