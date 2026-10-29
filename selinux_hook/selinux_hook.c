@@ -1442,9 +1442,49 @@ static void uninstall_inline_hooks(void)
 }
 
 /* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper */
+static bool value_has_root_token(const char *value, size_t size)
+{
+    static const char * const tokens[] = {
+        "magisk", "ksu", "lsposed", "xposed", "apatch",
+        "adbroot", "droidspacesd", "msd_daemon", "msd_app",
+        "su", "supersu", "kernelsu",
+    };
+    char sample[ACCESS_SAMPLE_MAX];
+    size_t len;
+    size_t i, j;
+
+    len = copy_query_sample(sample, value, size);
+    if (!len)
+        return false;
+
+    for (i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        size_t tlen = str_len_safe(tokens[i]);
+        if (!tlen || tlen > len)
+            continue;
+        for (j = 0; j + tlen <= len; j++) {
+            size_t k;
+            bool hit = true;
+            for (k = 0; k < tlen; k++) {
+                char c = sample[j + k];
+                if (c >= 'A' && c <= 'Z')
+                    c = (char)(c - 'A' + 'a');
+                if (c != tokens[i][k]) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit)
+                return true;
+        }
+    }
+    return false;
+}
+
 static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
     const char *name = (const char *)a->arg0;
+    const char *value = (const char *)a->arg1;
+    size_t size = (size_t)a->arg2;
     uid_t uid = current_uid();
     u32 n;
 
@@ -1460,6 +1500,16 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
     }
 
     if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
+        return;
+
+    /*
+     * Only enter the clean-eval scope when the candidate context itself
+     * carries a root-tool token. Ordinary probes (stock labels, malformed
+     * payloads, detector A/B timing samples) then take the untouched stock
+     * path, so per-payload cost stays stock; root candidates are still
+     * evaluated against the clean snapshot and answered with EINVAL.
+     */
+    if (!value_has_root_token(value, size))
         return;
 
     if (enter_clean_eval_scope())
