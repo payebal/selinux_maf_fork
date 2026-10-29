@@ -26,6 +26,13 @@
 
 #define offsetof_local(TYPE, MEMBER) ((size_t) & ((TYPE *)0)->MEMBER)
 
+/* copy_to_user through the KP_EXPORT_SYMBOL'd platform helper */
+static bool copy_to_user_helper(void *dst, const void *src, size_t n)
+{
+    int rc = compat_copy_to_user(dst, src, (int)n);
+    return rc != 0;
+}
+
 typedef unsigned long (*copy_from_user_fn_t)(void *to, const void *from, unsigned long n);
 static copy_from_user_fn_t copy_from_user_fn;
 
@@ -224,19 +231,8 @@ static void before_unix_stream_connect(hook_fargs4_t *a, void *u)
 }
 
 /*
- * copy_to_user through the platform helper. compat_copy_to_user is
- * KP_EXPORT_SYMBOL'd, so it resolves at load; wrapper defined below.
+ * copy_to_user wrapper lives at the top of the file now (before first use).
  */
-static bool copy_to_user_helper_impl(void *dst, const void *src, size_t n);
-
-#define copy_to_user_helper(d, s, n) copy_to_user_helper_impl((d), (s), (n))
-
-static bool copy_to_user_helper_impl(void *dst, const void *src, size_t n)
-{
-    int rc = compat_copy_to_user(dst, src, (int)n);
-    return rc != 0;
-}
-
 static long duckadbd_init(const char *args, const char *event, void *reserved)
 {
     unsigned long addr;
