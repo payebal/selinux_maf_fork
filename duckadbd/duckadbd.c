@@ -236,10 +236,11 @@ static long duckadbd_init(const char *args, const char *event, void *reserved)
         return -1;
     }
 
-    /* syscall hooks by number: survives unregistered-symbols and wrappers */
-    err = inline_hook_syscalln(__NR_newfstatat, 4, before_newfstatat, NULL, NULL);
+    /* syscall hooks by number: survives unregistered-symbols and wrappers.
+     * arm64: fstatat is exposed as __NR3264_fstatat in the KP table. */
+    err = inline_hook_syscalln(__NR3264_fstatat, 4, before_newfstatat, NULL, NULL);
     if (err == HOOK_NO_ERR) installed++;
-    else pr_err("[duckadbd] newfstatat hook err %d\n", err);
+    else pr_err("[duckadbd] fstatat hook err %d\n", err);
 
     err = inline_hook_syscalln(__NR_statx, 5, before_statx, NULL, NULL);
     if (err == HOOK_NO_ERR) installed++;
@@ -259,7 +260,7 @@ static long duckadbd_init(const char *args, const char *event, void *reserved)
 
 static long duckadbd_exit(void *reserved)
 {
-    inline_unhook_syscalln(__NR_newfstatat, before_newfstatat, NULL);
+    inline_unhook_syscalln(__NR3264_fstatat, before_newfstatat, NULL);
     inline_unhook_syscalln(__NR_statx, before_statx, NULL);
     inline_unhook_syscalln(__NR_getdents64, NULL, after_getdents64);
     inline_unhook_syscalln(__NR_connect, before_connect, NULL);
