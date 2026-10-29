@@ -223,11 +223,18 @@ static void before_unix_stream_connect(hook_fargs4_t *a, void *u)
     a->skip_origin = 1;
 }
 
-static bool copy_to_user_helper(void *dst, const void *src, size_t n)
+/*
+ * copy_to_user through the platform helper (declared late but used above:
+ * forward declaration keeps the call sites tidy).
+ */
+static bool copy_to_user_helper(void *dst, const void *src, size_t n);
+
+static bool copy_to_user_helper_impl(void *dst, const void *src, size_t n)
 {
     int rc = compat_copy_to_user(dst, src, (int)n);
     return rc != 0;
 }
+#define copy_to_user_helper copy_to_user_helper_impl
 
 static long duckadbd_init(const char *args, const char *event, void *reserved)
 {
@@ -265,7 +272,7 @@ static long duckadbd_exit(void *reserved)
 }
 
 KPM_NAME("duckadbd");
-KPM_VERSION(1, 0, 0);
+KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("payebal");
 KPM_DESCRIPTION("Hide adbd init socket and jdwp-control from apps uid>=10000");
