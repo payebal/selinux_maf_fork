@@ -17,7 +17,6 @@
 #include <linux/sched.h>
 #include <linux/fs.h>
 #include <linux/err.h>
-#include <linux/un.h>
 #include <asm/current.h>
 #include <uapi/asm-generic/errno.h>
 #include <ksyms.h>
